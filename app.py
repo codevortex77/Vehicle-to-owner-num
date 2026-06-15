@@ -13,7 +13,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# Proxy list - ONLY for Parivahan
+# Proxy list – all traffic will use these
 PROXIES = [
     "http://Lz8gYXGWn190_custom_zone_IN_st__city_sid_14068911_time_15:4318888@change5.owlproxy.com:7778",
     "http://Lz8gYXGWn190_custom_zone_IN_st__city_sid_76090875_time_15:4318888@change5.owlproxy.com:7778",
@@ -39,28 +39,23 @@ LOGIN_URL = "https://vahan.parivahan.gov.in/vahanservice/vahan/ui/usermgmt/login
 FORM_URL = "https://vahan.parivahan.gov.in/vahanservice/vahan/ui/balanceservice/form_reschedule_fitness.xhtml"
 
 def get_random_proxy():
-    """Get a random proxy from the list"""
-    return random.choice(PROXIES) if PROXIES else None
+    """Return a random proxy from the list"""
+    return random.choice(PROXIES)
 
-def create_session(use_proxy=False):
-    """
-    Create a session
-    use_proxy=False for SMC (direct connection)
-    use_proxy=True for Parivahan (proxy needed)
-    """
+def create_session_with_proxy():
+    """Create a session that forces all traffic through a proxy"""
     session = requests.Session()
     retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
-    
-    if use_proxy:
-        proxy = get_random_proxy()
-        session.proxies = {
-            'http': proxy,
-            'https': proxy
-        }
-    
+
+    proxy = get_random_proxy()
+    session.proxies = {
+        'http': proxy,
+        'https': proxy
+    }
+
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -72,43 +67,39 @@ def create_session(use_proxy=False):
 
 def get_vehicle_details_from_smc(vehicle_number):
     """
-    Get vehicle details from SMC API
-    NO PROXY - Direct connection
+    Fetch vehicle data from SMC Insurance – ALWAYS via proxy.
+    Retries with a different proxy on failure.
     """
-    try:
-        # Direct connection to SMC (no proxy)
-        with create_session(use_proxy=False) as s:
-            home = s.get(SMC_HOMEPAGE, timeout=15, verify=False)
+    for attempt in range(3):
+        try:
+            session = create_session_with_proxy()
+
+            # Get homepage for cookie
+            home = session.get(SMC_HOMEPAGE, timeout=20, verify=False)
             home.raise_for_status()
 
-            mcbc_cookie = s.cookies.get("MCBC")
-
+            mcbc_cookie = session.cookies.get("MCBC")
             if not mcbc_cookie:
-                return {"success": False, "error": "MCBC cookie not found"}
+                continue  # try next proxy
 
             payload = {
                 "url": "GetVaahanDetailsByVehicleNo",
-                "props": [
-                    vehicle_number,
-                    "",
-                    "0"
-                ]
+                "props": [vehicle_number, "", "0"]
             }
 
-            headers = {
+            api_headers = {
                 "Content-Type": "application/json",
                 "User-Agent": "okhttp/4.9.2",
                 "Cookie": f"MCBC={mcbc_cookie}"
             }
 
-            response = s.post(
+            response = session.post(
                 SMC_API,
-                headers=headers,
+                headers=api_headers,
                 json=payload,
-                timeout=15,
+                timeout=20,
                 verify=False
             )
-
             response.raise_for_status()
             data = response.json()
 
@@ -124,53 +115,51 @@ def get_vehicle_details_from_smc(vehicle_number):
                         "mobile_no": mobile_no,
                         "vehicle_data": vehicle_data
                     }
-                return {"success": False, "error": "Chassis too short or not found"}
+                return {"success": False, "error": "Chassis too short"}
+            else:
+                return {"success": False, "error": f"SMC returned status {data.get('statusCode')}"}
 
-            return {"success": False, "error": "SMC API returned no data"}
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)  # small delay before retrying with new proxy
+                continue
 
-    except Exception as e:
-        return {"success": False, "error": f"SMC Error: {str(e)}"}
+    return {"success": False, "error": "SMC unavailable – all proxies failed"}
 
 def extract_viewstate(html):
-    """Extract ViewState from HTML"""
     soup = BeautifulSoup(html, 'html.parser')
     vs = soup.find('input', {'name': 'javax.faces.ViewState'})
     return vs.get('value') if vs else None
 
 def extract_viewstate_from_ajax(text):
-    """Extract ViewState from AJAX response"""
     m = re.search(r'<update id="j_id1:javax.faces.ViewState:0"><!\[CDATA\[(.*?)\]\]></update>', text)
     return m.group(1) if m else None
 
 def find_checkbox_id(html):
-    """Find checkbox ID in HTML"""
     m = re.search(r'<div[^>]*id="(j_idt\d+)"[^>]*class="[^"]*ui-chkbox', html)
     if not m:
-        m = re.search(r'PrimeFaces.cw("SelectBooleanCheckbox"[^}]*id:"(j_idt\d+)"', html)
+        m = re.search(r'PrimeFaces.cw\("SelectBooleanCheckbox"[^}]*id:"(j_idt\d+)"', html)
     return m.group(1) if m else "j_idt193"
 
-def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
+def fetch_mobile_from_vahan(vehicle_number, chassis_last_5, fallback_mobile=""):
     """
-    Fetch mobile number from Parivahan portal
-    WITH PROXY - Parivahan blocks foreign IPs
+    Fetch mobile number from Parivahan – ALWAYS via proxy.
+    Retries once with a new proxy on failure.
     """
-    # Use proxy for Parivahan
-    session = create_session(use_proxy=True)
-
-    ajax_headers = {
-        'Accept': 'application/xml, text/xml, */*; q=0.01',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Faces-Request': 'partial/ajax',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Origin': 'https://vahan.parivahan.gov.in',
-    }
-
     for attempt in range(2):
         try:
-            # Step 1: Get homepage
+            session = create_session_with_proxy()
+
+            ajax_headers = {
+                'Accept': 'application/xml, text/xml, */*; q=0.01',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Faces-Request': 'partial/ajax',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Origin': 'https://vahan.parivahan.gov.in',
+            }
+
+            # Step 1
             r1 = session.get(HOMEPAGE_URL, timeout=30, verify=False)
-            if r1.status_code != 200:
-                continue
             viewstate = extract_viewstate(r1.text)
             if not viewstate:
                 continue
@@ -178,7 +167,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
             checkbox_id = find_checkbox_id(r1.text)
             ajax_headers['Referer'] = HOMEPAGE_URL
 
-            # Step 2: Office selection
+            # Step 2
             r2 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': 'fit_c_office_to',
@@ -191,7 +180,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
             }, headers=ajax_headers, timeout=30, verify=False)
             viewstate = extract_viewstate_from_ajax(r2.text) or viewstate
 
-            # Step 3: Checkbox
+            # Step 3
             r3 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': checkbox_id,
@@ -204,7 +193,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
             }, headers=ajax_headers, timeout=30, verify=False)
             viewstate = extract_viewstate_from_ajax(r3.text) or viewstate
 
-            # Step 4: Proceed button
+            # Step 4
             r4 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': 'proccedHomeButtonId',
@@ -216,7 +205,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
             }, headers=ajax_headers, timeout=30, verify=False)
             viewstate = extract_viewstate_from_ajax(r4.text) or viewstate
 
-            # Step 5: Dialog button
+            # Step 5
             dialog_match = re.search(r'id="(j_idt\d+)"[^>]*class="[^"]*ui-button', r4.text)
             dialog_btn = dialog_match.group(1) if dialog_match else "j_idt536"
             r5 = session.post(HOMEPAGE_BASE, data={
@@ -230,13 +219,13 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
             }, headers=ajax_headers, timeout=30, verify=False)
             viewstate = extract_viewstate_from_ajax(r5.text) or viewstate
 
-            # Step 6: Login page
+            # Step 6
             r6 = session.get(LOGIN_URL + "?faces-redirect=true", timeout=30, verify=False)
             viewstate = extract_viewstate(r6.text)
             if not viewstate:
                 continue
 
-            # Step 7: Login
+            # Step 7
             fit_match = re.search(r'id="(j_idt\d+)"[^>]*name="\1"[^>]*type="submit"', r6.text)
             fit_btn = fit_match.group(1) if fit_match else "j_idt506"
             post_headers = {
@@ -245,7 +234,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'Origin': 'https://vahan.parivahan.gov.in',
                 'Referer': LOGIN_URL + "?faces-redirect=true",
             }
-            r7 = session.post(LOGIN_URL, data={
+            session.post(LOGIN_URL, data={
                 'loginForm': 'loginForm',
                 f'{fit_btn}': fit_btn,
                 'javax.faces.ViewState': viewstate,
@@ -253,14 +242,14 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'pur_cd': '86',
             }, headers=post_headers, timeout=30, verify=False)
 
-            # Step 8: Form page
-            form_headers = {**session.headers, 'Referer': LOGIN_URL + "?faces-redirect=true"}
-            r8 = session.get(FORM_URL, headers=form_headers, timeout=30, verify=False)
+            # Step 8
+            r8 = session.get(FORM_URL, headers={**session.headers, 'Referer': LOGIN_URL + "?faces-redirect=true"},
+                            timeout=30, verify=False)
             viewstate = extract_viewstate(r8.text)
             if not viewstate:
                 continue
 
-            # Step 9: Validate details
+            # Step 9
             ajax_headers['Referer'] = FORM_URL
             r9 = session.post(FORM_URL, data={
                 'javax.faces.partial.ajax': 'true',
@@ -276,61 +265,57 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
 
             text = r9.text
 
-            # Find mobile number
+            # Search for mobile number
             for pat in [r'id="balanceFeesFine:tf_mobile"[^>]*value="(\d{10})"',
-                        r'value="(\d{10})"[^>]*id="balanceFeesFine:tf_mobile"',
-                        r'balanceFeesFine:tf_mobile[^>]*value="(\d{10})"']:
+                        r'value="(\d{10})"[^>]*id="balanceFeesFine:tf_mobile"']:
                 m = re.search(pat, text, re.DOTALL)
                 if m and m.group(1)[0] in '6789':
                     return {"success": True, "mobile_number": m.group(1)}
 
+            # Fallback: any 10-digit number starting with 6-9
             fallback = re.findall(r'\b[6-9]\d{9}\b', text)
             if fallback:
                 return {"success": True, "mobile_number": fallback[0]}
 
         except Exception as e:
-            print(f"Parivahan attempt {attempt+1}: {str(e)[:100]}")
+            if attempt == 0:
+                time.sleep(2)
 
-        if attempt == 0:
-            time.sleep(2)
-
-    # Return SMC mobile as fallback
+    # If Vahan fails, try the SMC mobile (if any)
     if fallback_mobile and len(fallback_mobile) == 10 and fallback_mobile[0] in '6789':
         return {"success": True, "mobile_number": fallback_mobile}
 
-    return {"success": False, "error": "Mobile number not found"}
+    return {"success": False, "error": "Could not retrieve mobile number"}
 
 @app.route("/fetch", methods=["GET"])
 def fetch_contact():
-    """Main endpoint"""
     vehicle_number = request.args.get("vehicle_number", "").strip().upper()
     vehicle_number = re.sub(r'[^A-Z0-9]', '', vehicle_number)
 
     if not vehicle_number or len(vehicle_number) < 6 or len(vehicle_number) > 12:
         return jsonify({"success": False, "error": "Invalid vehicle number"}), 400
 
-    # Step 1: Get chassis from SMC (Direct connection - no proxy)
+    # Step 1: SMC (via proxy)
     smc_result = get_vehicle_details_from_smc(vehicle_number)
-
     if not smc_result["success"]:
         return jsonify(smc_result), 400
 
-    # Step 2: Get mobile from Parivahan (With proxy)
-    mobile_result = fetch_mobile_number(
+    # Step 2: Vahan (via proxy)
+    mobile_result = fetch_mobile_from_vahan(
         vehicle_number,
         smc_result["chassis_last_5"],
         smc_result.get("mobile_no", "")
     )
 
-    mobile = None
+    final_mobile = None
     if mobile_result["success"]:
-        mobile = mobile_result["mobile_number"]
+        final_mobile = mobile_result["mobile_number"]
     elif smc_result.get("mobile_no"):
-        mobile = smc_result["mobile_no"]
+        final_mobile = smc_result["mobile_no"]
 
-    if mobile:
+    if final_mobile:
         vehicle_data = smc_result.get("vehicle_data", {})
-        vehicle_data["mobile_no"] = mobile
+        vehicle_data["mobile_no"] = final_mobile
         vehicle_data.pop("transKey", None)
         return jsonify({
             "statusCode": 200,
@@ -342,10 +327,9 @@ def fetch_contact():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status": "running",
-        "message": "Vehicle Insurance Contact Fetcher API",
-        "endpoint": "/fetch?vehicle_number=MH12AB1234",
-        "note": "SMC: Direct, Parivahan: Proxy"
+        "status": "online",
+        "message": "Vehicle Info API – 100% Proxy Routed",
+        "usage": "/fetch?vehicle_number=MH12AB1234"
     })
 
 if __name__ == "__main__":
