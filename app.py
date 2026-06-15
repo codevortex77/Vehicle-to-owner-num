@@ -41,7 +41,7 @@ def get_random_proxy():
 def create_session(use_proxy=True):
     """Create a session with optional proxy"""
     session = requests.Session()
-    retry = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
@@ -57,67 +57,91 @@ def create_session(use_proxy=True):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
+        'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
     })
     return session
 
 def get_vehicle_details_from_smc(vehicle_number):
-    """Get vehicle details from SMC API with proxy"""
-    try:
-        with create_session(use_proxy=True) as s:
-            home = s.get(SMC_HOMEPAGE, timeout=15)
-            home.raise_for_status()
+    """Get vehicle details from SMC API with retry and fallback"""
+    
+    # Try with proxy first, then without
+    for attempt in range(3):
+        try:
+            use_proxy = attempt < 2  # First 2 attempts with proxy, last without
+            with create_session(use_proxy=use_proxy) as s:
+                
+                # Try to get homepage for cookie
+                try:
+                    home = s.get(SMC_HOMEPAGE, timeout=10, verify=False)
+                    home.raise_for_status()
+                except Exception as e:
+                    print(f"Attempt {attempt+1} - Homepage failed: {str(e)[:100]}")
+                    time.sleep(2)
+                    continue
 
-            mcbc_cookie = s.cookies.get("MCBC")
+                mcbc_cookie = s.cookies.get("MCBC")
+                if not mcbc_cookie:
+                    print(f"Attempt {attempt+1} - No MCBC cookie")
+                    time.sleep(2)
+                    continue
 
-            if not mcbc_cookie:
-                return {"success": False, "error": "MCBC cookie not found"}
+                payload = {
+                    "url": "GetVaahanDetailsByVehicleNo",
+                    "props": [
+                        vehicle_number,
+                        "",
+                        "0"
+                    ]
+                }
 
-            payload = {
-                "url": "GetVaahanDetailsByVehicleNo",
-                "props": [
-                    vehicle_number,
-                    "",
-                    "0"
-                ]
-            }
+                headers = {
+                    "Content-Type": "application/json",
+                    "User-Agent": "okhttp/4.9.2",
+                    "Cookie": f"MCBC={mcbc_cookie}",
+                    "Accept": "application/json",
+                    "Connection": "keep-alive",
+                }
 
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "okhttp/4.9.2",
-                "Cookie": f"MCBC={mcbc_cookie}"
-            }
+                try:
+                    response = s.post(
+                        SMC_API,
+                        headers=headers,
+                        json=payload,
+                        timeout=15,
+                        verify=False
+                    )
+                    response.raise_for_status()
+                except Exception as e:
+                    print(f"Attempt {attempt+1} - API call failed: {str(e)[:100]}")
+                    time.sleep(2)
+                    continue
 
-            response = s.post(
-                SMC_API,
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
+                data = response.json()
 
-            response.raise_for_status()
+                if data.get("statusCode") == 200:
+                    vehicle_data = data.get("response", {})
+                    chassis = vehicle_data.get("chassis", "").replace(" ", "")
+                    mobile_no = vehicle_data.get("mobile_no", "")
 
-            data = response.json()
+                    if len(chassis) >= 5:
+                        return {
+                            "success": True,
+                            "chassis_last_5": chassis[-5:],
+                            "mobile_no": mobile_no,
+                            "vehicle_data": vehicle_data
+                        }
+                    return {"success": False, "error": "Chassis too short or not found"}
 
-            if data.get("statusCode") == 200:
-                vehicle_data = data.get("response", {})
-                chassis = vehicle_data.get("chassis", "").replace(" ", "")
-                mobile_no = vehicle_data.get("mobile_no", "")
+                return {"success": False, "error": "SMC API returned no data"}
 
-                if len(chassis) >= 5:
-                    return {
-                        "success": True,
-                        "chassis_last_5": chassis[-5:],
-                        "mobile_no": mobile_no,
-                        "vehicle_data": vehicle_data
-                    }
-                return {"success": False, "error": "Chassis too short or not found"}
+        except Exception as e:
+            print(f"Attempt {attempt+1} - Complete failure: {str(e)[:100]}")
+            time.sleep(2)
 
-            return {"success": False, "error": "SMC API returned no data"}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return {"success": False, "error": "Failed to connect to SMC after 3 attempts"}
 
 def extract_viewstate(html):
     """Extract ViewState from HTML"""
@@ -138,7 +162,7 @@ def find_checkbox_id(html):
     return m.group(1) if m else "j_idt193"
 
 def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
-    """Fetch mobile number from Vahan portal with proxy"""
+    """Fetch mobile number from Vahan portal"""
     session = create_session(use_proxy=True)
 
     ajax_headers = {
@@ -151,7 +175,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
 
     for attempt in range(2):
         try:
-            r1 = session.get(HOMEPAGE_URL, timeout=30)
+            r1 = session.get(HOMEPAGE_URL, timeout=20, verify=False)
             if r1.status_code != 200:
                 continue
             viewstate = extract_viewstate(r1.text)
@@ -159,8 +183,9 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 continue
 
             checkbox_id = find_checkbox_id(r1.text)
-
             ajax_headers['Referer'] = HOMEPAGE_URL
+
+            # Step 2
             r2 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': 'fit_c_office_to',
@@ -170,9 +195,10 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'homepageformid': 'homepageformid',
                 'fit_c_office_to_input': '1',
                 'javax.faces.ViewState': viewstate,
-            }, headers=ajax_headers, timeout=30)
+            }, headers=ajax_headers, timeout=20, verify=False)
             viewstate = extract_viewstate_from_ajax(r2.text) or viewstate
 
+            # Step 3
             r3 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': checkbox_id,
@@ -182,9 +208,10 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'homepageformid': 'homepageformid',
                 f'{checkbox_id}_input': 'on',
                 'javax.faces.ViewState': viewstate,
-            }, headers=ajax_headers, timeout=30)
+            }, headers=ajax_headers, timeout=20, verify=False)
             viewstate = extract_viewstate_from_ajax(r3.text) or viewstate
 
+            # Step 4
             r4 = session.post(HOMEPAGE_BASE, data={
                 'javax.faces.partial.ajax': 'true',
                 'javax.faces.source': 'proccedHomeButtonId',
@@ -193,9 +220,10 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'homepageformid': 'homepageformid',
                 f'{checkbox_id}_input': 'on',
                 'javax.faces.ViewState': viewstate,
-            }, headers=ajax_headers, timeout=30)
+            }, headers=ajax_headers, timeout=20, verify=False)
             viewstate = extract_viewstate_from_ajax(r4.text) or viewstate
 
+            # Step 5
             dialog_match = re.search(r'id="(j_idt\d+)"[^>]*class="[^"]*ui-button', r4.text)
             dialog_btn = dialog_match.group(1) if dialog_match else "j_idt536"
             r5 = session.post(HOMEPAGE_BASE, data={
@@ -206,14 +234,16 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'homepageformid': 'homepageformid',
                 f'{checkbox_id}_input': 'on',
                 'javax.faces.ViewState': viewstate,
-            }, headers=ajax_headers, timeout=30)
+            }, headers=ajax_headers, timeout=20, verify=False)
             viewstate = extract_viewstate_from_ajax(r5.text) or viewstate
 
-            r6 = session.get(LOGIN_URL + "?faces-redirect=true", timeout=30, allow_redirects=True)
+            # Step 6
+            r6 = session.get(LOGIN_URL + "?faces-redirect=true", timeout=20, verify=False)
             viewstate = extract_viewstate(r6.text)
             if not viewstate:
                 continue
 
+            # Step 7
             fit_match = re.search(r'id="(j_idt\d+)"[^>]*name="\1"[^>]*type="submit"', r6.text)
             fit_btn = fit_match.group(1) if fit_match else "j_idt506"
             post_headers = {
@@ -228,14 +258,16 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'javax.faces.ViewState': viewstate,
                 'fitbalcTest': 'fitbalcTest',
                 'pur_cd': '86',
-            }, headers=post_headers, timeout=30, allow_redirects=True)
+            }, headers=post_headers, timeout=20, verify=False)
 
+            # Step 8
             form_headers = {**session.headers, 'Referer': LOGIN_URL + "?faces-redirect=true"}
-            r8 = session.get(FORM_URL, headers=form_headers, timeout=30)
+            r8 = session.get(FORM_URL, headers=form_headers, timeout=20, verify=False)
             viewstate = extract_viewstate(r8.text)
             if not viewstate:
                 continue
 
+            # Step 9 - Final validation
             ajax_headers['Referer'] = FORM_URL
             r9 = session.post(FORM_URL, data={
                 'javax.faces.partial.ajax': 'true',
@@ -247,10 +279,11 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 'balanceFeesFine:tf_reg_no': vehicle_number,
                 'balanceFeesFine:tf_chasis_no': chassis_last_5,
                 'javax.faces.ViewState': viewstate,
-            }, headers=ajax_headers, timeout=30)
+            }, headers=ajax_headers, timeout=20, verify=False)
 
             text = r9.text
 
+            # Try to find mobile number
             for pat in [r'id="balanceFeesFine:tf_mobile"[^>]*value="(\d{10})"',
                         r'value="(\d{10})"[^>]*id="balanceFeesFine:tf_mobile"',
                         r'balanceFeesFine:tf_mobile[^>]*value="(\d{10})"']:
@@ -263,7 +296,7 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
                 return {"success": True, "mobile_number": fallback[0]}
 
         except Exception as e:
-            print(f"Attempt {attempt+1}: {e}")
+            print(f"Vahan attempt {attempt+1}: {str(e)[:100]}")
 
         if attempt == 0:
             time.sleep(2)
@@ -273,6 +306,10 @@ def fetch_mobile_number(vehicle_number, chassis_last_5, fallback_mobile=""):
 
     return {"success": False, "error": "Mobile number not found"}
 
+# Disable SSL warnings for problematic connections
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 @app.route("/fetch", methods=["GET"])
 def fetch_contact():
     """Main endpoint to fetch vehicle contact details"""
@@ -280,35 +317,46 @@ def fetch_contact():
     vehicle_number = re.sub(r'[^A-Z0-9]', '', vehicle_number)
 
     if not vehicle_number or len(vehicle_number) < 6 or len(vehicle_number) > 12:
-        return jsonify({"success": False, "error": "Invalid vehicle number"}), 400
+        return jsonify({"success": False, "error": "Invalid vehicle number format"}), 400
 
+    # Get details from SMC
     smc_result = get_vehicle_details_from_smc(vehicle_number)
 
     if not smc_result["success"]:
-        return jsonify({"success": False, "error": smc_result["error"]}), 400
+        return jsonify(smc_result), 400
 
-    mobile_result = fetch_mobile_number(
-        vehicle_number,
-        smc_result["chassis_last_5"],
-        smc_result.get("mobile_no", "")
-    )
+    # If we got chassis, try Vahan portal
+    if smc_result.get("chassis_last_5"):
+        mobile_result = fetch_mobile_number(
+            vehicle_number,
+            smc_result["chassis_last_5"],
+            smc_result.get("mobile_no", "")
+        )
 
-    mobile = None
-    if mobile_result["success"]:
-        mobile = mobile_result["mobile_number"]
-    elif smc_result.get("mobile_no"):
-        mobile = smc_result["mobile_no"]
+        mobile = None
+        if mobile_result["success"]:
+            mobile = mobile_result["mobile_number"]
+        elif smc_result.get("mobile_no"):
+            mobile = smc_result["mobile_no"]
 
-    if mobile:
+        if mobile:
+            vehicle_data = smc_result.get("vehicle_data", {})
+            vehicle_data["mobile_no"] = mobile
+            vehicle_data.pop("transKey", None)
+            return jsonify({
+                "statusCode": 200,
+                "response": vehicle_data
+            })
+    else:
+        # Just return SMC data without Vahan lookup
         vehicle_data = smc_result.get("vehicle_data", {})
-        vehicle_data["mobile_no"] = mobile
         vehicle_data.pop("transKey", None)
         return jsonify({
             "statusCode": 200,
             "response": vehicle_data
         })
 
-    return jsonify({"success": False, "error": mobile_result["error"]}), 400
+    return jsonify({"success": False, "error": "Could not retrieve mobile number"}), 400
 
 @app.route("/", methods=["GET"])
 def home():
@@ -318,9 +366,6 @@ def home():
         "endpoint": "/fetch?vehicle_number=MH12AB1234",
         "message": "Vehicle Insurance Contact Fetcher API"
     })
-
-# For Vercel
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
